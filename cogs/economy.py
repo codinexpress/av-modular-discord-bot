@@ -9,19 +9,23 @@ from typing import Dict, Optional, Tuple, Union
 import discord
 from discord.ext import commands
 
+MAX_AMOUNT_CAP = 100_000_000_000  # $100 Billion max cap for transactions
+
 
 # ==============================================================================
 # DATABASE MANAGER
 # ==============================================================================
 class EconomyDB:
-    """Handles SQLite database interactions using asyncio thread delegation."""
+    """Handles SQLite database interactions using asyncio thread delegation and atomic transactions."""
 
     def __init__(self, db_path: str = "economy.db"):
         self.db_path = db_path
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
         return conn
 
     def setup_database(self) -> None:
@@ -116,6 +120,132 @@ class EconomyDB:
                 return dict(row)
 
         return await asyncio.to_thread(_update)
+
+    async def transfer_funds(
+        self, from_user_id: int, to_user_id: int, guild_id: int, amount: int
+    ) -> Tuple[bool, str]:
+        """Atomically transfers money between users inside an immediate SQLite transaction."""
+
+        def _transfer():
+            with self._get_connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT wallet FROM accounts WHERE user_id = ? AND guild_id = ?",
+                    (from_user_id, guild_id),
+                )
+                row = cursor.fetchone()
+                if not row or row["wallet"] < amount:
+                    conn.rollback()
+                    return False, "Insufficient wallet balance."
+
+                cursor.execute(
+                    "SELECT wallet FROM accounts WHERE user_id = ? AND guild_id = ?",
+                    (to_user_id, guild_id),
+                )
+                if not cursor.fetchone():
+                    cursor.execute(
+                        "INSERT INTO accounts (user_id, guild_id, wallet, bank, bank_max) VALUES (?, ?, 100, 0, 5000)",
+                        (to_user_id, guild_id),
+                    )
+
+                cursor.execute(
+                    "UPDATE accounts SET wallet = wallet - ? WHERE user_id = ? AND guild_id = ?",
+                    (amount, from_user_id, guild_id),
+                )
+                cursor.execute(
+                    "UPDATE accounts SET wallet = wallet + ? WHERE user_id = ? AND guild_id = ?",
+                    (amount, to_user_id, guild_id),
+                )
+                conn.commit()
+                return True, "Success"
+
+        return await asyncio.to_thread(_transfer)
+
+    async def deposit_funds(
+        self, user_id: int, guild_id: int, amount: int
+    ) -> Tuple[bool, str]:
+        """Atomically transfers money from wallet to bank."""
+
+        def _deposit():
+            with self._get_connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT wallet, bank, bank_max FROM accounts WHERE user_id = ? AND guild_id = ?",
+                    (user_id, guild_id),
+                )
+                row = cursor.fetchone()
+                if not row or row["wallet"] < amount:
+                    conn.rollback()
+                    return False, "Insufficient wallet balance."
+                if row["bank"] + amount > row["bank_max"]:
+                    conn.rollback()
+                    return False, "Bank space exceeded."
+
+                cursor.execute(
+                    "UPDATE accounts SET wallet = wallet - ?, bank = bank + ? WHERE user_id = ? AND guild_id = ?",
+                    (amount, amount, user_id, guild_id),
+                )
+                conn.commit()
+                return True, "Success"
+
+        return await asyncio.to_thread(_deposit)
+
+    async def withdraw_funds(
+        self, user_id: int, guild_id: int, amount: int
+    ) -> Tuple[bool, str]:
+        """Atomically transfers money from bank to wallet."""
+
+        def _withdraw():
+            with self._get_connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT bank FROM accounts WHERE user_id = ? AND guild_id = ?",
+                    (user_id, guild_id),
+                )
+                row = cursor.fetchone()
+                if not row or row["bank"] < amount:
+                    conn.rollback()
+                    return False, "Insufficient bank balance."
+
+                cursor.execute(
+                    "UPDATE accounts SET bank = bank - ?, wallet = wallet + ? WHERE user_id = ? AND guild_id = ?",
+                    (amount, amount, user_id, guild_id),
+                )
+                conn.commit()
+                return True, "Success"
+
+        return await asyncio.to_thread(_withdraw)
+
+    async def process_wager(
+        self, user_id: int, guild_id: int, wager: int, net_payout: int
+    ) -> Tuple[bool, Dict[str, int]]:
+        """Atomically checks wallet balance and applies net win/loss payout."""
+
+        def _wager():
+            with self._get_connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT wallet FROM accounts WHERE user_id = ? AND guild_id = ?",
+                    (user_id, guild_id),
+                )
+                row = cursor.fetchone()
+                if not row or row["wallet"] < wager:
+                    conn.rollback()
+                    return False, {}
+
+                cursor.execute(
+                    "UPDATE accounts SET wallet = MAX(0, wallet + ?) WHERE user_id = ? AND guild_id = ? RETURNING wallet, bank, bank_max",
+                    (net_payout, user_id, guild_id),
+                )
+                updated_row = cursor.fetchone()
+                conn.commit()
+                return True, dict(updated_row)
+
+        return await asyncio.to_thread(_wager)
 
     async def get_leaderboard(self, guild_id: int, limit: int = 10):
         """Fetches top accounts by total wealth in a guild."""
@@ -221,21 +351,23 @@ ITEMS = {
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
-def parse_amount(amount_str: str, current_val: int, max_limit: Optional[int] = None) -> Optional[int]:
-    """Parses numbers, 'all', 'max', 'half', and shorthand like '1.5k', '2m'."""
+def parse_amount(
+    amount_str: str, current_val: int, max_limit: Optional[int] = None
+) -> Optional[int]:
+    """Parses numbers, 'all', 'max', 'half', and shorthand like '1.5k', '2m' safely."""
     amount_str = amount_str.lower().strip()
 
     if amount_str in ("all", "max"):
         target = current_val
         if max_limit is not None:
             target = min(target, max_limit)
-        return target
+        return target if 0 < target <= MAX_AMOUNT_CAP else None
 
     if amount_str == "half":
         target = current_val // 2
         if max_limit is not None:
             target = min(target, max_limit)
-        return target
+        return target if 0 < target <= MAX_AMOUNT_CAP else None
 
     # Handle standard numbers with optional suffixes
     match = re.match(r"^(\d+(?:\.\d+)?)([kmb])?$", amount_str)
@@ -243,17 +375,26 @@ def parse_amount(amount_str: str, current_val: int, max_limit: Optional[int] = N
         return None
 
     val, multiplier = match.groups()
-    num = float(val)
+    try:
+        num = float(val)
+        if multiplier == "k":
+            num *= 1_000
+        elif multiplier == "m":
+            num *= 1_000_000
+        elif multiplier == "b":
+            num *= 1_000_000_000
 
-    if multiplier == "k":
-        num *= 1_000
-    elif multiplier == "m":
-        num *= 1_000_000
-    elif multiplier == "b":
-        num *= 1_000_000_000
+        if math.isnan(num) or math.isinf(num):
+            return None
 
-    result = int(num)
-    return result if result > 0 else None
+        result = int(num)
+        if 0 < result <= MAX_AMOUNT_CAP:
+            if max_limit is not None:
+                result = min(result, max_limit)
+            return result
+        return None
+    except (ValueError, OverflowError):
+        return None
 
 
 def format_curr(amount: int) -> str:
@@ -276,7 +417,10 @@ class Economy(commands.Cog):
     # BANKING & ACCOUNT COMMANDS
     # --------------------------------------------------------------------------
     @commands.command(name="balance", aliases=["bal", "money"])
-    async def balance(self, ctx: commands.Context, member: Optional[discord.Member] = None):
+    @commands.guild_only()
+    async def balance(
+        self, ctx: commands.Context, member: Optional[discord.Member] = None
+    ):
         """Displays wallet, bank, and total net worth."""
         target = member or ctx.author
         if target.bot:
@@ -302,29 +446,33 @@ class Economy(commands.Cog):
         await ctx.send(embed=embed)
 
     @commands.command(name="deposit", aliases=["dep"])
+    @commands.guild_only()
     async def deposit(self, ctx: commands.Context, amount: str):
         """Deposits cash from wallet into bank storage."""
         acc = await self.db.get_account(ctx.author.id, ctx.guild.id)
         space_available = max(0, acc["bank_max"] - acc["bank"])
 
         if space_available <= 0:
-            await ctx.send("❌ Your bank account is full! Buy a Bank Vault to store more.")
+            await ctx.send(
+                "❌ Your bank account is full! Buy a Bank Vault to store more."
+            )
             return
 
         parsed = parse_amount(amount, acc["wallet"], space_available)
-
         if parsed is None or parsed <= 0:
             await ctx.send("❌ Invalid deposit amount specified.")
             return
 
-        if parsed > acc["wallet"]:
-            await ctx.send("❌ You don't have that much cash in your wallet.")
-            return
-
-        await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=-parsed, bank_change=parsed)
-        await ctx.send(f"✅ Deposited **{format_curr(parsed)}** into your bank.")
+        success, err_msg = await self.db.deposit_funds(
+            ctx.author.id, ctx.guild.id, parsed
+        )
+        if success:
+            await ctx.send(f"✅ Deposited **{format_curr(parsed)}** into your bank.")
+        else:
+            await ctx.send(f"❌ Deposit failed: {err_msg}")
 
     @commands.command(name="withdraw", aliases=["with"])
+    @commands.guild_only()
     async def withdraw(self, ctx: commands.Context, amount: str):
         """Withdraws cash from bank to wallet."""
         acc = await self.db.get_account(ctx.author.id, ctx.guild.id)
@@ -334,14 +482,16 @@ class Economy(commands.Cog):
             await ctx.send("❌ Invalid withdrawal amount specified.")
             return
 
-        if parsed > acc["bank"]:
-            await ctx.send("❌ You don't have that much cash stored in your bank.")
-            return
-
-        await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=parsed, bank_change=-parsed)
-        await ctx.send(f"✅ Withdrew **{format_curr(parsed)}** from your bank.")
+        success, err_msg = await self.db.withdraw_funds(
+            ctx.author.id, ctx.guild.id, parsed
+        )
+        if success:
+            await ctx.send(f"✅ Withdrew **{format_curr(parsed)}** from your bank.")
+        else:
+            await ctx.send(f"❌ Withdrawal failed: {err_msg}")
 
     @commands.command(name="pay", aliases=["give", "transfer"])
+    @commands.guild_only()
     async def pay(self, ctx: commands.Context, member: discord.Member, amount: str):
         """Transfers money directly to another member's wallet."""
         if member.id == ctx.author.id:
@@ -358,16 +508,18 @@ class Economy(commands.Cog):
             await ctx.send("❌ Invalid transfer amount specified.")
             return
 
-        if parsed > sender_acc["wallet"]:
-            await ctx.send("❌ You lack sufficient wallet balance for this transfer.")
-            return
-
-        await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=-parsed)
-        await self.db.update_balances(member.id, ctx.guild.id, wallet_change=parsed)
-
-        await ctx.send(f"💸 Successfully paid **{format_curr(parsed)}** to {member.mention}.")
+        success, err_msg = await self.db.transfer_funds(
+            ctx.author.id, member.id, ctx.guild.id, parsed
+        )
+        if success:
+            await ctx.send(
+                f"💸 Successfully paid **{format_curr(parsed)}** to {member.mention}."
+            )
+        else:
+            await ctx.send(f"❌ Transfer failed: {err_msg}")
 
     @commands.command(name="leaderboard", aliases=["lb", "richest"])
+    @commands.guild_only()
     async def leaderboard(self, ctx: commands.Context):
         """Shows top 10 richest members in the server."""
         records = await self.db.get_leaderboard(ctx.guild.id, limit=10)
@@ -393,7 +545,8 @@ class Economy(commands.Cog):
     # EARNING & WORK COMMANDS
     # --------------------------------------------------------------------------
     @commands.command(name="work")
-    @commands.cooldown(1, 3600, commands.BucketType.user)  # 1 Hour Cooldown
+    @commands.guild_only()
+    @commands.cooldown(1, 3600, commands.BucketType.user)
     async def work(self, ctx: commands.Context):
         """Work a shift to earn money."""
         jobs = [
@@ -405,11 +558,16 @@ class Economy(commands.Cog):
         ]
         job, salary = random.choice(jobs)
 
-        await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=salary)
-        await ctx.send(f"💼 You worked as a **{job}** and earned **{format_curr(salary)}**!")
+        await self.db.update_balances(
+            ctx.author.id, ctx.guild.id, wallet_change=salary
+        )
+        await ctx.send(
+            f"💼 You worked as a **{job}** and earned **{format_curr(salary)}**!"
+        )
 
     @commands.command(name="beg")
-    @commands.cooldown(1, 60, commands.BucketType.user)  # 1 Minute Cooldown
+    @commands.guild_only()
+    @commands.cooldown(1, 60, commands.BucketType.user)
     async def beg(self, ctx: commands.Context):
         """Beg strangers for spare change."""
         if random.random() < 0.35:
@@ -424,46 +582,79 @@ class Economy(commands.Cog):
         gain = random.randint(15, 120)
         await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=gain)
 
-        donors = ["a kind stranger", "a sympathetic pedestrian", "a local business owner", "your neighbor"]
-        await ctx.send(f"🪙 {random.choice(donors).capitalize()} gave you **{format_curr(gain)}**!")
+        donors = [
+            "a kind stranger",
+            "a sympathetic pedestrian",
+            "a local business owner",
+            "your neighbor",
+        ]
+        await ctx.send(
+            f"🪙 {random.choice(donors).capitalize()} gave you **{format_curr(gain)}**!"
+        )
 
     @commands.command(name="daily")
-    @commands.cooldown(1, 86400, commands.BucketType.user)  # 24 Hours
+    @commands.guild_only()
+    @commands.cooldown(1, 86400, commands.BucketType.user)
     async def daily(self, ctx: commands.Context):
         """Claims daily cash stipend."""
         reward = 1000
-        await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=reward)
-        await ctx.send(f"☀️ You claimed your daily reward of **{format_curr(reward)}**!")
+        await self.db.update_balances(
+            ctx.author.id, ctx.guild.id, wallet_change=reward
+        )
+        await ctx.send(
+            f"☀️ You claimed your daily reward of **{format_curr(reward)}**!"
+        )
 
     @commands.command(name="weekly")
-    @commands.cooldown(1, 604800, commands.BucketType.user)  # 7 Days
+    @commands.guild_only()
+    @commands.cooldown(1, 604800, commands.BucketType.user)
     async def weekly(self, ctx: commands.Context):
         """Claims weekly bonus payment."""
         reward = 7500
-        await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=reward)
-        await ctx.send(f"🗓️ You claimed your weekly reward of **{format_curr(reward)}**!")
+        await self.db.update_balances(
+            ctx.author.id, ctx.guild.id, wallet_change=reward
+        )
+        await ctx.send(
+            f"🗓️ You claimed your weekly reward of **{format_curr(reward)}**!"
+        )
 
     @commands.command(name="crime")
-    @commands.cooldown(1, 1800, commands.BucketType.user)  # 30 Mins
+    @commands.guild_only()
+    @commands.cooldown(1, 1800, commands.BucketType.user)
     async def crime(self, ctx: commands.Context):
         """Perform high-risk criminal activity."""
         success = random.random() > 0.45
 
         if success:
             gain = random.randint(500, 1500)
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=gain)
-            crimes = ["robbed an ATM", "hacked an office server", "ran an illegal street gamble"]
-            await ctx.send(f"🥷 You successfully {random.choice(crimes)} and looted **{format_curr(gain)}**!")
+            await self.db.update_balances(
+                ctx.author.id, ctx.guild.id, wallet_change=gain
+            )
+            crimes = [
+                "robbed an ATM",
+                "hacked an office server",
+                "ran an illegal street gamble",
+            ]
+            await ctx.send(
+                f"🥷 You successfully {random.choice(crimes)} and looted **{format_curr(gain)}**!"
+            )
         else:
             fine = random.randint(250, 800)
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=-fine)
-            await ctx.send(f"🚨 You were caught by law enforcement and fined **{format_curr(fine)}**!")
+            await self.db.update_balances(
+                ctx.author.id, ctx.guild.id, wallet_change=-fine
+            )
+            await ctx.send(
+                f"🚨 You were caught by law enforcement and fined **{format_curr(fine)}**!"
+            )
 
     @commands.command(name="fish")
+    @commands.guild_only()
     @commands.cooldown(1, 120, commands.BucketType.user)
     async def fish(self, ctx: commands.Context):
         """Go fishing for valuable catches."""
-        has_rod = await self.db.get_item_count(ctx.author.id, ctx.guild.id, "rod") > 0
+        has_rod = (
+            await self.db.get_item_count(ctx.author.id, ctx.guild.id, "rod") > 0
+        )
         bonus = 1.5 if has_rod else 1.0
 
         outcomes = [
@@ -477,17 +668,24 @@ class Economy(commands.Cog):
 
         item_name, value = random.choices(outcomes, weights=weights)[0]
         if value > 0:
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=value)
+            await self.db.update_balances(
+                ctx.author.id, ctx.guild.id, wallet_change=value
+            )
             extra = " (Rod bonus applied!)" if has_rod else ""
-            await ctx.send(f"🎣 You caught {item_name} worth **{format_curr(value)}**!{extra}")
+            await ctx.send(
+                f"🎣 You caught {item_name} worth **{format_curr(value)}**!{extra}"
+            )
         else:
             await ctx.send(f"🎣 You pulled up {item_name}. Worthless!")
 
     @commands.command(name="mine")
+    @commands.guild_only()
     @commands.cooldown(1, 300, commands.BucketType.user)
     async def mine(self, ctx: commands.Context):
         """Mine minerals and ores."""
-        has_pick = await self.db.get_item_count(ctx.author.id, ctx.guild.id, "pickaxe") > 0
+        has_pick = (
+            await self.db.get_item_count(ctx.author.id, ctx.guild.id, "pickaxe") > 0
+        )
         multiplier = 2.0 if has_pick else 1.0
 
         ores = [
@@ -501,12 +699,15 @@ class Economy(commands.Cog):
         name, val = random.choices(ores, weights=weights)[0]
         await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=val)
         extra = " (Pickaxe bonus applied!)" if has_pick else ""
-        await ctx.send(f"⛏️ You mined **{name}** and sold it for **{format_curr(val)}**!{extra}")
+        await ctx.send(
+            f"⛏️ You mined **{name}** and sold it for **{format_curr(val)}**!{extra}"
+        )
 
     # --------------------------------------------------------------------------
     # PVP STEALING & INTERACTION COMMANDS
     # --------------------------------------------------------------------------
     @commands.command(name="rob", aliases=["steal"])
+    @commands.guild_only()
     @commands.cooldown(1, 3600, commands.BucketType.user)
     async def rob(self, ctx: commands.Context, target: discord.Member):
         """Steal cash from another member's wallet."""
@@ -521,10 +722,14 @@ class Economy(commands.Cog):
         victim_acc = await self.db.get_account(target.id, ctx.guild.id)
 
         if robber_acc["wallet"] < 250:
-            await ctx.send("❌ You need at least **$250** in your wallet to cover court fees if caught.")
+            await ctx.send(
+                "❌ You need at least **$250** in your wallet to cover court fees if caught."
+            )
             return
         if victim_acc["wallet"] < 200:
-            await ctx.send("❌ This member has less than **$200** in their wallet. Not worth it!")
+            await ctx.send(
+                "❌ This member has less than **$200** in their wallet. Not worth it!"
+            )
             return
 
         # Check shield item defense
@@ -541,15 +746,20 @@ class Economy(commands.Cog):
             stolen_percentage = random.uniform(0.20, 0.60)
             stolen = int(victim_acc["wallet"] * stolen_percentage)
 
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=stolen)
-            await self.db.update_balances(target.id, ctx.guild.id, wallet_change=-stolen)
-
-            await ctx.send(f"🥷 Successful heist! You robbed **{format_curr(stolen)}** from {target.mention}!")
+            success, _ = await self.db.transfer_funds(
+                target.id, ctx.author.id, ctx.guild.id, stolen
+            )
+            if success:
+                await ctx.send(
+                    f"🥷 Successful heist! You robbed **{format_curr(stolen)}** from {target.mention}!"
+                )
+            else:
+                await ctx.send("❌ The heist failed unexpectedly.")
         else:
             penalty = int(robber_acc["wallet"] * 0.30)
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=-penalty)
-            await self.db.update_balances(target.id, ctx.guild.id, wallet_change=penalty)
-
+            await self.db.transfer_funds(
+                ctx.author.id, target.id, ctx.guild.id, penalty
+            )
             await ctx.send(
                 f"🚨 You got caught! You paid **{format_curr(penalty)}** in compensation to {target.mention}."
             )
@@ -558,6 +768,7 @@ class Economy(commands.Cog):
     # GAMBLING & MINI GAMES
     # --------------------------------------------------------------------------
     @commands.command(name="coinflip", aliases=["cf"])
+    @commands.guild_only()
     async def coinflip(self, ctx: commands.Context, choice: str, bet: str):
         """Wager cash on a coinflip (heads or tails)."""
         choice = choice.lower()
@@ -575,14 +786,29 @@ class Economy(commands.Cog):
             return
 
         outcome = random.choice(["heads", "tails"])
-        if choice == outcome:
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=wager)
-            await ctx.send(f"🪙 Coin landed on **{outcome}**! You won **{format_curr(wager)}**!")
+        is_win = choice == outcome
+        net_payout = wager if is_win else -wager
+
+        success, _ = await self.db.process_wager(
+            ctx.author.id, ctx.guild.id, wager, net_payout
+        )
+        if not success:
+            await ctx.send(
+                "❌ Transaction failed. Insufficient funds in wallet."
+            )
+            return
+
+        if is_win:
+            await ctx.send(
+                f"🪙 Coin landed on **{outcome}**! You won **{format_curr(wager)}**!"
+            )
         else:
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=-wager)
-            await ctx.send(f"🪙 Coin landed on **{outcome}**! You lost **{format_curr(wager)}**.")
+            await ctx.send(
+                f"🪙 Coin landed on **{outcome}**! You lost **{format_curr(wager)}**."
+            )
 
     @commands.command(name="slots")
+    @commands.guild_only()
     async def slots(self, ctx: commands.Context, bet: str):
         """Play the slot machine."""
         acc = await self.db.get_account(ctx.author.id, ctx.guild.id)
@@ -593,24 +819,35 @@ class Economy(commands.Cog):
             return
 
         emojis = ["🍒", "🍋", "🔔", "💎", "7️⃣"]
-        reel1, reel2, reel3 = random.choice(emojis), random.choice(emojis), random.choice(emojis)
-
+        reel1, reel2, reel3 = (
+            random.choice(emojis),
+            random.choice(emojis),
+            random.choice(emojis),
+        )
         display = f"🎰 **[ {reel1} | {reel2} | {reel3} ]** 🎰\n"
 
         if reel1 == reel2 == reel3:
             multiplier = 5 if reel1 == "7️⃣" else 3
-            payout = wager * multiplier
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=payout)
-            await ctx.send(f"{display}🎉 **JACKPOT!** You won **{format_curr(payout)}** ({multiplier}x)!")
+            net_payout = wager * multiplier
+            result_str = f"{display}🎉 **JACKPOT!** You won **{format_curr(net_payout)}** ({multiplier}x)!"
         elif reel1 == reel2 or reel2 == reel3 or reel1 == reel3:
-            payout = int(wager * 1.5)
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=payout)
-            await ctx.send(f"{display}✨ Two of a kind! You won **{format_curr(payout)}**!")
+            net_payout = int(wager * 1.5)
+            result_str = f"{display}✨ Two of a kind! You won **{format_curr(net_payout)}**!"
         else:
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=-wager)
-            await ctx.send(f"{display}❌ No match. You lost **{format_curr(wager)}**.")
+            net_payout = -wager
+            result_str = f"{display}❌ No match. You lost **{format_curr(wager)}**."
+
+        success, _ = await self.db.process_wager(
+            ctx.author.id, ctx.guild.id, wager, net_payout
+        )
+        if not success:
+            await ctx.send("❌ Wager failed. Insufficient funds in wallet.")
+            return
+
+        await ctx.send(result_str)
 
     @commands.command(name="dice")
+    @commands.guild_only()
     async def dice(self, ctx: commands.Context, bet: str):
         """Roll dice against the bot."""
         acc = await self.db.get_account(ctx.author.id, ctx.guild.id)
@@ -622,22 +859,32 @@ class Economy(commands.Cog):
 
         user_roll = random.randint(1, 6) + random.randint(1, 6)
         bot_roll = random.randint(1, 6) + random.randint(1, 6)
-
         msg = f"🎲 You rolled **{user_roll}** | Bot rolled **{bot_roll}**\n"
 
         if user_roll > bot_roll:
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=wager)
-            await ctx.send(f"{msg}🎉 You won **{format_curr(wager)}**!")
+            net_payout = wager
+            result_str = f"{msg}🎉 You won **{format_curr(wager)}**!"
         elif bot_roll > user_roll:
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=-wager)
-            await ctx.send(f"{msg}❌ You lost **{format_curr(wager)}**.")
+            net_payout = -wager
+            result_str = f"{msg}❌ You lost **{format_curr(wager)}**."
         else:
             await ctx.send(f"{msg}🤝 It's a draw! Wager refunded.")
+            return
+
+        success, _ = await self.db.process_wager(
+            ctx.author.id, ctx.guild.id, wager, net_payout
+        )
+        if not success:
+            await ctx.send("❌ Wager failed. Insufficient funds in wallet.")
+            return
+
+        await ctx.send(result_str)
 
     # --------------------------------------------------------------------------
     # SHOP & INVENTORY COMMANDS
     # --------------------------------------------------------------------------
     @commands.command(name="shop")
+    @commands.guild_only()
     async def shop(self, ctx: commands.Context):
         """Displays available items in the server shop."""
         embed = discord.Embed(
@@ -656,40 +903,53 @@ class Economy(commands.Cog):
         await ctx.send(embed=embed)
 
     @commands.command(name="buy")
+    @commands.guild_only()
     async def buy(self, ctx: commands.Context, item_id: str, amount: int = 1):
         """Purchase an item from shop."""
         item_id = item_id.lower()
         if item_id not in ITEMS:
             await ctx.send("❌ Invalid item ID. Check `!shop` for valid items.")
             return
-        if amount <= 0:
-            await ctx.send("❌ Amount must be greater than zero.")
+        if amount <= 0 or amount > 1000:
+            await ctx.send("❌ Amount must be between 1 and 1000.")
             return
 
         item = ITEMS[item_id]
         total_cost = item["price"] * amount
-        acc = await self.db.get_account(ctx.author.id, ctx.guild.id)
 
-        if acc["wallet"] < total_cost:
-            await ctx.send(f"❌ You need **{format_curr(total_cost)}** in wallet to buy this.")
+        # Deduct wallet atomically using process_wager (-total_cost)
+        success, _ = await self.db.process_wager(
+            ctx.author.id, ctx.guild.id, total_cost, -total_cost
+        )
+        if not success:
+            await ctx.send(
+                f"❌ You need **{format_curr(total_cost)}** in wallet to buy this."
+            )
             return
-
-        await self.db.update_balances(ctx.author.id, ctx.guild.id, wallet_change=-total_cost)
 
         if item_id == "vault":
             # Vault increases bank max directly
             capacity_increase = 10000 * amount
-            await self.db.update_balances(ctx.author.id, ctx.guild.id, bank_max_change=capacity_increase)
+            await self.db.update_balances(
+                ctx.author.id, ctx.guild.id, bank_max_change=capacity_increase
+            )
             await ctx.send(
                 f"✅ Purchased **{amount}x {item['name']}**! Your bank limit expanded by +{format_curr(capacity_increase)}."
             )
         else:
             # Store in inventory
-            await self.db.update_item_count(ctx.author.id, ctx.guild.id, item_id, amount)
-            await ctx.send(f"✅ Purchased **{amount}x {item['name']}** for **{format_curr(total_cost)}**!")
+            await self.db.update_item_count(
+                ctx.author.id, ctx.guild.id, item_id, amount
+            )
+            await ctx.send(
+                f"✅ Purchased **{amount}x {item['name']}** for **{format_curr(total_cost)}**!"
+            )
 
     @commands.command(name="inventory", aliases=["inv"])
-    async def inventory(self, ctx: commands.Context, member: Optional[discord.Member] = None):
+    @commands.guild_only()
+    async def inventory(
+        self, ctx: commands.Context, member: Optional[discord.Member] = None
+    ):
         """Displays owned items."""
         target = member or ctx.author
         items = await self.db.get_user_inventory(target.id, ctx.guild.id)
@@ -714,50 +974,36 @@ class Economy(commands.Cog):
     # ADMIN / MODERATION COMMANDS
     # --------------------------------------------------------------------------
     @commands.command(name="addmoney")
+    @commands.guild_only()
     @commands.has_permissions(administrator=True)
-    async def add_money(self, ctx: commands.Context, member: discord.Member, amount: int):
+    async def add_money(
+        self, ctx: commands.Context, member: discord.Member, amount: int
+    ):
         """Admin command to grant funds to a user."""
-        if amount <= 0:
-            await ctx.send("❌ Specify a positive number.")
+        if amount <= 0 or amount > MAX_AMOUNT_CAP:
+            await ctx.send("❌ Specify a positive number up to 100 Billion.")
             return
 
         await self.db.update_balances(member.id, ctx.guild.id, wallet_change=amount)
-        await ctx.send(f"✅ Added **{format_curr(amount)}** to {member.mention}'s wallet.")
+        await ctx.send(
+            f"✅ Added **{format_curr(amount)}** to {member.mention}'s wallet."
+        )
 
     @commands.command(name="removemoney")
+    @commands.guild_only()
     @commands.has_permissions(administrator=True)
-    async def remove_money(self, ctx: commands.Context, member: discord.Member, amount: int):
+    async def remove_money(
+        self, ctx: commands.Context, member: discord.Member, amount: int
+    ):
         """Admin command to remove wallet funds from a user."""
-        if amount <= 0:
-            await ctx.send("❌ Specify a positive number.")
+        if amount <= 0 or amount > MAX_AMOUNT_CAP:
+            await ctx.send("❌ Specify a positive number up to 100 Billion.")
             return
 
         await self.db.update_balances(member.id, ctx.guild.id, wallet_change=-amount)
-        await ctx.send(f"✅ Removed **{format_curr(amount)}** from {member.mention}'s wallet.")
-
-    # --------------------------------------------------------------------------
-    # ERROR HANDLING
-    # --------------------------------------------------------------------------
-    @commands.Cog.listener()
-    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
-        """Handles cooldown errors gracefully across cog commands."""
-        if isinstance(error, commands.CommandOnCooldown):
-            seconds = int(error.retry_after)
-            hours, remainder = divmod(seconds, 3600)
-            minutes, secs = divmod(remainder, 60)
-
-            time_str = []
-            if hours > 0:
-                time_str.append(f"{hours}h")
-            if minutes > 0:
-                time_str.append(f"{minutes}m")
-            if secs > 0 or not time_str:
-                time_str.append(f"{secs}s")
-
-            await ctx.send(
-                f"⏳ **Cooldown!** You can use `!{ctx.command.name}` again in **{' '.join(time_str)}**.",
-                delete_after=10,
-            )
+        await ctx.send(
+            f"✅ Removed **{format_curr(amount)}** from {member.mention}'s wallet."
+        )
 
 
 # Setup extension hook for main.py dynamic loading

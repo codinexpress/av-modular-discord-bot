@@ -139,9 +139,20 @@ class DynamicHelpView(discord.ui.View):
         await interaction.message.delete()
         self.stop()
 
+    async def on_timeout(self) -> None:
+        """Disables all view components when the timeout expires."""
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
     # --------------------------------------------------------------------------
     # PAGINATION HELPERS & EMBED GENERATION
     # --------------------------------------------------------------------------
+
     async def _handle_pagination(self, interaction: discord.Interaction, page: int):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
