@@ -3,13 +3,22 @@ aiohttp==3.14.2
 aiosignal==1.4.0
 attrs==26.1.0
 audioop-lts==0.2.2
+certifi==2026.6.17
+charset-normalizer==3.4.9
+discord==2.3.2
 discord.py==2.7.1
 frozenlist==1.8.0
 idna==3.18
+iniconfig==2.3.0
 multidict==6.7.1
+packaging==26.2
+pluggy==1.6.0
+proot-distro @ file:///home/builder/.termux-build/proot-distro/src
 propcache==0.5.2
-python-dotenv==1.2.2
-yarl==1.24.5
+Pygments==2.20.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
-
+python-dotenv==1.2.2
+requests==2.34.2
+urllib3==2.7.0
+yarl==1.24.5
