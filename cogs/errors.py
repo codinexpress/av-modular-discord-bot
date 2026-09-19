@@ -22,6 +22,14 @@ class ErrorHandler(commands.Cog):
         if isinstance(error, commands.CommandNotFound):
             return
 
+        prefix = ctx.clean_prefix if ctx.prefix else "!"
+        cmd_name = ctx.command.qualified_name if ctx.command else "command"
+        cmd_signature = (
+            f"{prefix}{ctx.command.qualified_name} {ctx.command.signature}".strip()
+            if ctx.command
+            else "unknown"
+        )
+
         # Cooldown handling
         if isinstance(error, commands.CommandOnCooldown):
             seconds = int(error.retry_after)
@@ -39,7 +47,7 @@ class ErrorHandler(commands.Cog):
             time_str = " ".join(time_parts)
             embed = discord.Embed(
                 title="⏳ Cooldown Active",
-                description=f"You can use `!{ctx.command.name}` again in **{time_str}**.",
+                description=f"You can use `{prefix}{cmd_name}` again in **{time_str}**.",
                 color=discord.Color.gold(),
             )
             await ctx.send(embed=embed, delete_after=10)
@@ -47,7 +55,6 @@ class ErrorHandler(commands.Cog):
 
         # Missing required arguments
         if isinstance(error, commands.MissingRequiredArgument):
-            cmd_signature = f"!{ctx.command.qualified_name} {ctx.command.signature}"
             embed = discord.Embed(
                 title="❌ Missing Parameter",
                 description=f"Missing required parameter: `{error.param.name}`\n\n**Correct Usage:** `{cmd_signature}`",
@@ -58,7 +65,6 @@ class ErrorHandler(commands.Cog):
 
         # Invalid arguments
         if isinstance(error, (commands.BadArgument, commands.ArgumentParsingError)):
-            cmd_signature = f"!{ctx.command.qualified_name} {ctx.command.signature}"
             embed = discord.Embed(
                 title="❌ Invalid Input",
                 description=f"One or more provided arguments are invalid.\n\n**Correct Usage:** `{cmd_signature}`",

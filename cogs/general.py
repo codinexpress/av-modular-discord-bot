@@ -1,3 +1,4 @@
+import logging
 import discord
 from discord.ext import commands
 
@@ -10,7 +11,7 @@ class General(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        print(f"Cog '{self.__class__.__name__}' loaded successfully.")
+        logging.info(f"Cog '{self.__class__.__name__}' loaded successfully.")
 
     @commands.command(name="ping", help="Responds with the bot's latency.")
     async def ping(self, ctx: commands.Context):

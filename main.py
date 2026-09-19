@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import signal
 import sys
 import discord
 from discord.ext import commands

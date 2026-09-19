@@ -107,9 +107,9 @@ class EconomyDB:
                     (
                         user_id,
                         guild_id,
-                        100 + wallet_change,
-                        0 + bank_change,
-                        5000 + bank_max_change,
+                        max(0, 100 + wallet_change),
+                        max(0, 0 + bank_change),
+                        max(1000, 5000 + bank_max_change),
                         wallet_change,
                         bank_change,
                         bank_max_change,
@@ -135,7 +135,16 @@ class EconomyDB:
                     (from_user_id, guild_id),
                 )
                 row = cursor.fetchone()
-                if not row or row["wallet"] < amount:
+                if not row:
+                    cursor.execute(
+                        "INSERT INTO accounts (user_id, guild_id, wallet, bank, bank_max) VALUES (?, ?, 100, 0, 5000)",
+                        (from_user_id, guild_id),
+                    )
+                    from_wallet = 100
+                else:
+                    from_wallet = row["wallet"]
+
+                if from_wallet < amount:
                     conn.rollback()
                     return False, "Insufficient wallet balance."
 
@@ -176,10 +185,19 @@ class EconomyDB:
                     (user_id, guild_id),
                 )
                 row = cursor.fetchone()
-                if not row or row["wallet"] < amount:
+                if not row:
+                    cursor.execute(
+                        "INSERT INTO accounts (user_id, guild_id, wallet, bank, bank_max) VALUES (?, ?, 100, 0, 5000)",
+                        (user_id, guild_id),
+                    )
+                    wallet, bank, bank_max = 100, 0, 5000
+                else:
+                    wallet, bank, bank_max = row["wallet"], row["bank"], row["bank_max"]
+
+                if wallet < amount:
                     conn.rollback()
                     return False, "Insufficient wallet balance."
-                if row["bank"] + amount > row["bank_max"]:
+                if bank + amount > bank_max:
                     conn.rollback()
                     return False, "Bank space exceeded."
 
@@ -206,7 +224,16 @@ class EconomyDB:
                     (user_id, guild_id),
                 )
                 row = cursor.fetchone()
-                if not row or row["bank"] < amount:
+                if not row:
+                    cursor.execute(
+                        "INSERT INTO accounts (user_id, guild_id, wallet, bank, bank_max) VALUES (?, ?, 100, 0, 5000)",
+                        (user_id, guild_id),
+                    )
+                    bank = 0
+                else:
+                    bank = row["bank"]
+
+                if bank < amount:
                     conn.rollback()
                     return False, "Insufficient bank balance."
 
@@ -233,7 +260,16 @@ class EconomyDB:
                     (user_id, guild_id),
                 )
                 row = cursor.fetchone()
-                if not row or row["wallet"] < wager:
+                if not row:
+                    cursor.execute(
+                        "INSERT INTO accounts (user_id, guild_id, wallet, bank, bank_max) VALUES (?, ?, 100, 0, 5000)",
+                        (user_id, guild_id),
+                    )
+                    wallet = 100
+                else:
+                    wallet = row["wallet"]
+
+                if wallet < wager:
                     conn.rollback()
                     return False, {}
 

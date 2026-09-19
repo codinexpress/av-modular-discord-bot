@@ -185,9 +185,10 @@ class DynamicHelpView(discord.ui.View):
         prefix = self.ctx.clean_prefix
 
         # --- HOME OVERVIEW EMBED ---
+        bot_name = self.bot.user.name if self.bot.user else "Bot"
         if self.current_category == "home":
             embed = discord.Embed(
-                title=f"📖 {self.bot.user.name} Help Center",
+                title=f"📖 {bot_name} Help Center",
                 description=(
                     f"Welcome to the command directory!\n\n"
                     f"• **Command Prefix:** `{prefix}`\n"
@@ -273,16 +274,6 @@ class DynamicHelpView(discord.ui.View):
         self._update_button_states()
         embed = self._build_embed()
         await interaction.response.edit_message(embed=embed, view=self)
-
-    async def on_timeout(self):
-        """Disables all UI elements when the view times out."""
-        for item in self.children:
-            item.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
 
 
 # ==============================================================================
